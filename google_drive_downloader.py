@@ -302,6 +302,28 @@ def add_extension_if_missing(filename, content_type=None):
     return filename
 
 
+def get_unique_filepath(output_dir, filename):
+    """
+    如果目标文件已经存在，则自动在文件名后添加数字：
+    video.mp4
+    video (1).mp4
+    video (2).mp4
+    ...
+    """
+    filename = sanitize_filename(filename) or "video"
+
+    stem, ext = os.path.splitext(filename)
+    candidate = os.path.join(output_dir, filename)
+
+    number = 1
+    while os.path.exists(candidate) or os.path.exists(candidate + ".part"):
+        candidate_name = f"{stem} ({number}){ext}"
+        candidate = os.path.join(output_dir, candidate_name)
+        number += 1
+
+    return candidate
+
+
 # ============================================================
 # Drive 页面文件信息
 # ============================================================
@@ -720,6 +742,7 @@ class Downloader:
         output_dir,
         index,
         total,
+        custom_name=None,
     ):
         for attempt in range(1, MAX_RETRIES + 1):
 
@@ -732,6 +755,7 @@ class Downloader:
                     output_dir,
                     index,
                     total,
+                    custom_name,
                 )
 
             except Exception as e:
@@ -763,6 +787,7 @@ class Downloader:
         output_dir,
         index,
         total,
+        custom_name=None,
     ):
         session = requests.Session()
         session.headers.update(HEADERS)
@@ -811,17 +836,17 @@ class Downloader:
                     )
                 )
 
+            # ------------------------------------------------
+            # ④ 文件名
+            # 如果勾选“允许改名”，则优先使用这一行链接后面的名称
+            # ------------------------------------------------
+            if custom_name:
+                filename = sanitize_filename(custom_name)
+
             if not filename:
                 filename = file_id
 
-            filename = clean_drive_filename(filename)
-
-            if not filename:
-                filename = file_id
-
-            # ------------------------------------------------
-            # ④ 自动补视频扩展名
-            # ------------------------------------------------
+            # 自动补视频扩展名
             filename = add_extension_if_missing(
                 filename,
                 content_type,
@@ -829,11 +854,19 @@ class Downloader:
 
             filename = sanitize_filename(filename)
 
-            final_path = os.path.join(
+            if not filename:
+                filename = file_id
+
+            # 如果重名，自动变成：
+            # 文件名.mp4
+            # 文件名 (1).mp4
+            # 文件名 (2).mp4
+            final_path = get_unique_filepath(
                 output_dir,
                 filename,
             )
 
+            filename = os.path.basename(final_path)
             part_path = final_path + ".part"
 
             self.app.log(
@@ -1190,6 +1223,23 @@ class App:
         )
 
         style.configure(
+            "Treeview",
+            background="#222222",
+            foreground="#F0F0F0",
+            fieldbackground="#222222",
+        )
+
+        style.map(
+            "Treeview",
+            background=[
+                ("selected", "#FFFFFF"),
+            ],
+            foreground=[
+                ("selected", "#000000"),
+            ],
+        )
+
+        style.configure(
             "Horizontal.TProgressbar",
             background="#4CAF50",
             troughcolor="#303030",
@@ -1230,12 +1280,12 @@ class App:
         )
 
         # ====================================================
-        # 链接
+        # 视频链接表格
         # ====================================================
 
         link_frame = ttk.LabelFrame(
             main,
-            text="粘贴 Google Drive 链接（一行一个）",
+            text="视频链接列表",
             padding=10,
         )
 
@@ -1244,36 +1294,142 @@ class App:
             expand=True,
         )
 
-        self.link_text = tk.Text(
-            link_frame,
-            font=("Consolas", 10),
-            wrap="none",
-            bg="#202020",
-            fg="#F0F0F0",
-            insertbackground="#FFFFFF",
-            selectbackground="#444444",
-            relief="flat",
+        table_frame = ttk.Frame(link_frame)
+        table_frame.pack(
+            fill="both",
+            expand=True,
         )
 
-        self.link_text.pack(
+        self.link_tree = ttk.Treeview(
+            table_frame,
+            columns=("url", "name"),
+            show="headings",
+            selectmode="extended",
+        )
+
+        self.link_tree.heading(
+            "url",
+            text="链接",
+        )
+
+        self.link_tree.heading(
+            "name",
+            text="新文件名",
+        )
+
+        self.link_tree.column(
+            "url",
+            width=650,
+            anchor="w",
+        )
+
+        self.link_tree.column(
+            "name",
+            width=280,
+            anchor="w",
+        )
+
+        tree_scroll = ttk.Scrollbar(
+            table_frame,
+            orient="vertical",
+            command=self.link_tree.yview,
+        )
+
+        self.link_tree.configure(
+            yscrollcommand=tree_scroll.set,
+        )
+
+        self.link_tree.pack(
             side="left",
             fill="both",
             expand=True,
         )
 
-        link_scroll = ttk.Scrollbar(
-            link_frame,
-            orient="vertical",
-            command=self.link_text.yview,
-        )
-
-        link_scroll.pack(
+        tree_scroll.pack(
             side="right",
             fill="y",
         )
 
-        self.link_text.configure(
-            yscrollcommand=link_scroll.set
+        ttk.Label(
+            link_frame,
+            text="双击单元格可以编辑；勾选“允许改名”后，第二列的新文件名才会生效。",
+        ).pack(
+            anchor="w",
+            pady=(6, 4),
+        )
+
+        table_btn_frame = ttk.Frame(link_frame)
+        table_btn_frame.pack(
+            fill="x",
+            pady=(0, 4),
+        )
+
+        ttk.Button(
+            table_btn_frame,
+            text="添加链接",
+            command=self.add_link_row,
+        ).pack(
+            side="left",
+            padx=(0, 5),
+        )
+
+        ttk.Button(
+            table_btn_frame,
+            text="删除选中",
+            command=self.delete_selected_rows,
+        ).pack(
+            side="left",
+            padx=5,
+        )
+
+        ttk.Button(
+            table_btn_frame,
+            text="清空列表",
+            command=self.clear_link_rows,
+        ).pack(
+            side="left",
+            padx=5,
+        )
+
+        self.link_tree.bind(
+            "<Double-1>",
+            self.edit_link_cell,
+        )
+
+        # 支持直接把剪贴板中的整列链接粘贴到“链接”列。
+        # 一行一个链接；如果没有选中行，则从列表末尾继续添加。
+        self.link_tree.bind(
+            "<Control-v>",
+            self.paste_links,
+        )
+        self.link_tree.bind(
+            "<Control-V>",
+            self.paste_links,
+        )
+        self.link_tree.bind(
+            "<Shift-Insert>",
+            self.paste_links,
+        )
+
+        self.rename_var = tk.BooleanVar(
+            value=False,
+        )
+
+        ttk.Checkbutton(
+            link_frame,
+            text="允许改名",
+            variable=self.rename_var,
+        ).pack(
+            anchor="w",
+            pady=(2, 0),
+        )
+
+        ttk.Label(
+            link_frame,
+            text="未勾选：使用 Google Drive 原文件名；勾选：使用第二列填写的新文件名。",
+        ).pack(
+            anchor="w",
+            pady=(2, 0),
         )
 
         # ====================================================
@@ -1518,14 +1674,7 @@ class App:
         if self.downloading:
             return
 
-        self.link_text.delete(
-            "1.0",
-            "end",
-        )
-
-    # --------------------------------------------------------
-    # 日志
-    # --------------------------------------------------------
+        self.clear_link_rows()
 
     def log(self, text):
 
@@ -1696,21 +1845,197 @@ class App:
     # 开始
     # --------------------------------------------------------
 
+    def add_link_row(self):
+        self.link_tree.insert("", "end", values=("", ""))
+
+    def delete_selected_rows(self):
+        for item in self.link_tree.selection():
+            self.link_tree.delete(item)
+
+    def clear_link_rows(self):
+        for item in self.link_tree.get_children():
+            self.link_tree.delete(item)
+
+    def edit_link_cell(self, event):
+        item = self.link_tree.identify_row(event.y)
+        column = self.link_tree.identify_column(event.x)
+        if not item or column not in ("#1", "#2"):
+            return
+
+        bbox = self.link_tree.bbox(item, column)
+        if not bbox:
+            return
+
+        x, y, width, height = bbox
+        values = list(self.link_tree.item(item, "values"))
+        index = 0 if column == "#1" else 1
+
+        # 不再使用 ttk.Entry，避免某些 Windows 主题下编辑框变成白底。
+        # 直接使用 tk.Entry，并明确指定深色背景/浅色文字。
+        entry = tk.Entry(
+            self.link_tree,
+            bg="#2B2B2B",
+            fg="#F0F0F0",
+            insertbackground="#FFFFFF",
+            selectbackground="#444444",
+            selectforeground="#FFFFFF",
+            relief="flat",
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground="#555555",
+            highlightcolor="#666666",
+            font=("Microsoft YaHei", 10),
+        )
+        entry.place(x=x, y=y, width=width, height=height)
+        entry.insert(0, values[index])
+        entry.select_range(0, tk.END)
+        entry.focus_set()
+
+        def save(event=None):
+            if not entry.winfo_exists():
+                return
+            values[index] = entry.get().strip()
+            self.link_tree.item(item, values=values)
+            entry.destroy()
+
+        def cancel(event=None):
+            if entry.winfo_exists():
+                entry.destroy()
+
+        entry.bind("<Return>", save)
+        entry.bind("<Escape>", cancel)
+        entry.bind("<FocusOut>", save)
+
+    def paste_links(self, event=None):
+        """
+        直接把剪贴板中的多行链接粘贴到“链接”列。
+        例如：
+            https://drive.google.com/file/d/AAA/view
+            https://drive.google.com/file/d/BBB/view
+            https://drive.google.com/file/d/CCC/view
+
+        粘贴后会自动逐行创建/覆盖列表中的链接行。
+        如果当前选中了某一行，则从该行开始粘贴；
+        如果没有选中行，则从列表末尾追加。
+        """
+        try:
+            clipboard = self.root.clipboard_get()
+        except tk.TclError:
+            return "break"
+
+        if not clipboard or not clipboard.strip():
+            return "break"
+
+        # 兼容从 Excel / 表格复制整列时带来的 \t。
+        # 每一行只取第一列作为链接，空行自动忽略。
+        links = []
+        for line in clipboard.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+
+            first_cell = line.split("\t", 1)[0].strip()
+            if first_cell:
+                links.append(first_cell)
+
+        if not links:
+            return "break"
+
+        children = list(self.link_tree.get_children())
+        selection = self.link_tree.selection()
+
+        if selection:
+            # 以当前选中的第一行作为粘贴起点。
+            try:
+                start_index = children.index(selection[0])
+            except ValueError:
+                start_index = len(children)
+        else:
+            start_index = len(children)
+
+        # 确保有足够的行。
+        while len(self.link_tree.get_children()) < start_index + len(links):
+            self.link_tree.insert("", "end", values=("", ""))
+
+        children = list(self.link_tree.get_children())
+
+        for offset, link in enumerate(links):
+            item = children[start_index + offset]
+            values = list(self.link_tree.item(item, "values"))
+
+            if len(values) < 2:
+                values = [link, ""]
+            else:
+                values[0] = link
+
+            self.link_tree.item(item, values=values)
+
+        # 选中刚粘贴的区域，方便用户继续操作。
+        children = list(self.link_tree.get_children())
+        pasted_items = children[start_index:start_index + len(links)]
+        self.link_tree.selection_set(pasted_items)
+        if pasted_items:
+            self.link_tree.focus(pasted_items[0])
+            self.link_tree.see(pasted_items[0])
+
+        self.log(f"已粘贴 {len(links)} 个链接。")
+        return "break"
+
     def start_download(self):
 
         if self.downloading:
             return
 
-        text = self.link_text.get(
-            "1.0",
-            "end",
-        ).strip()
+        download_items = []
 
-        if not text:
+        for item in self.link_tree.get_children():
+
+            values = self.link_tree.item(
+                item,
+                "values",
+            )
+
+            url = (
+                values[0].strip()
+                if len(values) > 0
+                else ""
+            )
+
+            custom_name = (
+                values[1].strip()
+                if len(values) > 1
+                else ""
+            )
+
+            if not url:
+                continue
+
+            file_id = extract_file_id(url)
+
+            if not file_id:
+                self.log(
+                    f"跳过无效链接：{url}"
+                )
+                continue
+
+            if not self.rename_var.get():
+                custom_name = None
+
+            elif not custom_name:
+                custom_name = None
+
+            download_items.append(
+                (
+                    file_id,
+                    custom_name,
+                )
+            )
+
+        if not download_items:
 
             messagebox.showwarning(
                 "提示",
-                "请先粘贴 Google Drive 链接。",
+                "请先添加有效的 Google Drive 视频链接。",
             )
 
             return
@@ -1726,120 +2051,48 @@ class App:
 
             return
 
-        try:
-            os.makedirs(
-                output_dir,
-                exist_ok=True,
-            )
-        except Exception as e:
+        os.makedirs(
+            output_dir,
+            exist_ok=True,
+        )
 
-            messagebox.showerror(
-                "错误",
-                f"无法创建下载目录：\n{e}",
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # 提取 ID
-        # ----------------------------------------------------
-
-        file_ids = []
-        seen = set()
-        invalid = 0
-
-        for line in text.splitlines():
-
-            line = line.strip()
-
-            if not line:
-                continue
-
-            file_id = extract_file_id(line)
-
-            if not file_id:
-                invalid += 1
-                continue
-
-            if file_id in seen:
-                continue
-
-            seen.add(file_id)
-            file_ids.append(file_id)
-
-        if not file_ids:
-
-            messagebox.showerror(
-                "错误",
-                "没有识别到有效的 Google Drive 链接。",
-            )
-
-            return
-
-        # ----------------------------------------------------
-        # 初始化
-        # ----------------------------------------------------
-
-        self.total_files = len(file_ids)
-        self.finished_files = 0
         self.downloading = True
-
-        self.total_progress["value"] = 0
-        self.file_progress["value"] = 0
-
-        self.total_progress_var.set(
-            f"总进度：0 / {self.total_files}"
-        )
-
-        self.current_file_var.set(
-            "准备下载..."
-        )
+        self.total_files = len(download_items)
+        self.finished_files = 0
 
         self.start_button.configure(
-            state="disabled"
+            state="disabled",
         )
 
         self.stop_button.configure(
-            state="normal"
+            state="normal",
         )
 
-        self.downloader = Downloader(self)
-
-        self.log(
-            "=========================================="
+        self.downloader = Downloader(
+            self
         )
-
-        self.log(
-            f"开始下载，共 {self.total_files} 个文件"
-        )
-
-        if invalid:
-            self.log(
-                f"无法识别并跳过：{invalid} 行"
-            )
 
         thread = threading.Thread(
             target=self.download_thread,
-            args=(file_ids, output_dir),
+            args=(
+                download_items,
+                output_dir,
+            ),
             daemon=True,
         )
 
         thread.start()
 
-    # --------------------------------------------------------
-    # 下载线程
-    # --------------------------------------------------------
-
     def download_thread(
         self,
-        file_ids,
+        download_items,
         output_dir,
     ):
 
-        total = len(file_ids)
+        total = len(download_items)
 
-        for index, file_id in enumerate(
-            file_ids,
+        for index, (file_id, custom_name) in enumerate(
+            download_items,
             1,
         ):
 
@@ -1851,11 +2104,18 @@ class App:
                 f"File ID：{file_id}"
             )
 
+            if custom_name:
+                self.log(
+                    f"[{index}/{total}] "
+                    f"自定义文件名：{custom_name}"
+                )
+
             self.downloader.download_file(
                 file_id,
                 output_dir,
                 index,
                 total,
+                custom_name,
             )
 
         self.root.after(
