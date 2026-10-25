@@ -2,7 +2,7 @@
 
 
 a = Analysis(
-    ['G:/Python/google_download/google_drive_downloader.py'],
+    ['google_drive_downloader.py'],
     pathex=[],
     binaries=[],
     datas=[],

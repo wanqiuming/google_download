@@ -1,2219 +1,758 @@
+"""Google Drive batch downloader using the Drive API and per-user OAuth."""
+from __future__ import annotations
+
 import os
+import mimetypes
+import queue
 import re
-import html
-import time
+import sys
 import threading
-from urllib.parse import urlparse, parse_qs, unquote, urljoin
-
-import requests
-from bs4 import BeautifulSoup
-
+import time
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
 
-
-# ============================================================
-# 配置
-# ============================================================
-
-CHUNK_SIZE = 1024 * 1024
-TIMEOUT = 60
-MAX_RETRIES = 3
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/151.0.0.0 Safari/537.36"
+URL_RE = re.compile(r"https?://(?:drive|docs)\.google\.com/[^\s]+", re.I)
+ID_RE = re.compile(
+    r"(?:/folders/|/file/d/|/(?:document|spreadsheets|presentation)/d/|/d/|[?&]id=)([\w-]+)",
+    re.I,
 )
-
-HEADERS = {
-    "User-Agent": USER_AGENT,
-    "Accept": "*/*",
-    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+FOLDER_MIME = "application/vnd.google-apps.folder"
+EXPORTS = {
+    "application/vnd.google-apps.document": (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document", ".docx"),
+    "application/vnd.google-apps.spreadsheet": (
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", ".xlsx"),
+    "application/vnd.google-apps.presentation": (
+        "application/vnd.openxmlformats-officedocument.presentationml.presentation", ".pptx"),
 }
-
-VIDEO_EXTENSIONS = {
-    "video/mp4": ".mp4",
-    "video/x-m4v": ".m4v",
-    "video/quicktime": ".mov",
-    "video/x-msvideo": ".avi",
-    "video/x-matroska": ".mkv",
-    "video/webm": ".webm",
-    "video/mpeg": ".mpeg",
-    "video/3gpp": ".3gp",
-    "video/3gpp2": ".3g2",
-    "application/mp4": ".mp4",
-}
-
-MAGIC_HEADERS = {
-    b"\x00\x00\x00": "mp4/mov",
-    b"\x1a\x45\xdf\xa3": "webm/mkv",
-    b"RIFF": "avi/webm",
-    b"\x00\x00\x01\xba": "mpeg",
-    b"\x00\x00\x01\xb3": "mpeg",
+MIME_EXTENSIONS = {
+    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+    "image/gif": ".gif", "image/webp": ".webp", "image/bmp": ".bmp",
+    "image/tiff": ".tif", "image/heic": ".heic", "image/heif": ".heif",
+    "image/avif": ".avif", "image/svg+xml": ".svg",
+    "video/mp4": ".mp4", "video/quicktime": ".mov", "video/x-matroska": ".mkv",
+    "video/webm": ".webm", "video/x-msvideo": ".avi", "video/x-ms-wmv": ".wmv",
+    "video/mpeg": ".mpeg", "video/3gpp": ".3gp", "video/x-flv": ".flv",
+    "video/x-m4v": ".m4v", "video/m4v": ".m4v",
 }
 
 
-# ============================================================
-# 基础工具
-# ============================================================
+def is_folder_link(url: str) -> bool:
+    return bool(re.search(r"/folders/[\w-]+", url, re.I))
 
-def extract_file_id(url):
-    if not url:
-        return None
 
-    url = url.strip()
-
-    match = re.search(r"/file/d/([a-zA-Z0-9_-]+)", url)
-    if match:
-        return match.group(1)
-
-    try:
-        parsed = urlparse(url)
-        query = parse_qs(parsed.query)
-        if "id" in query and query["id"]:
-            return query["id"][0]
-    except Exception:
-        pass
-
-    match = re.search(r"[?&]id=([a-zA-Z0-9_-]+)", url)
-    if match:
-        return match.group(1)
-
-    if re.fullmatch(r"[a-zA-Z0-9_-]{10,}", url):
-        return url
-
-    return None
-
-
-def format_size(size):
-    if size is None:
-        return "未知"
-
-    try:
-        size = int(size)
-    except Exception:
-        return "未知"
-
-    units = ["B", "KB", "MB", "GB", "TB"]
-    value = float(size)
-
-    for unit in units:
-        if value < 1024:
-            return f"{value:.2f} {unit}"
-        value /= 1024
-
-    return f"{value:.2f} PB"
-
-
-def format_speed(speed):
-    if not speed or speed <= 0:
-        return "--"
-    return format_size(speed) + "/s"
-
-
-def sanitize_filename(filename):
-    if not filename:
-        return None
-
-    filename = html.unescape(str(filename))
-    filename = filename.replace("\x00", "")
-
-    # Windows 禁止字符
-    filename = re.sub(r'[<>:"/\\|?*]', "_", filename)
-
-    # 控制字符
-    filename = re.sub(r"[\x00-\x1F]", "_", filename)
-
-    # 文件名末尾不能是空格或点
-    filename = filename.rstrip(" .")
-
-    if not filename:
-        return None
-
-    # Windows 保留名称
-    reserved = {
-        "CON", "PRN", "AUX", "NUL",
-        *(f"COM{i}" for i in range(1, 10)),
-        *(f"LPT{i}" for i in range(1, 10)),
-    }
-
-    stem = os.path.splitext(filename)[0]
-    if stem.upper() in reserved:
-        filename = "_" + filename
-
-    return filename
-
-
-def fix_mojibake(text):
-    """
-    修复常见的：
-    UTF-8 字节被错误按 Latin-1/CP1252 解码的问题。
-
-    例如：
-    è´ºç¶
-    -> 贺然
-    """
-
-    if not text:
-        return text
-
-    # 常见 UTF-8 乱码特征
-    markers = (
-        "Ã", "Â", "â", "ð",
-        "è", "é", "ê", "ë",
-        "ì", "í", "î", "ï",
-        "æ", "ç", "å", "ã",
-        "¤", " "
-    )
-
-    if not any(c in text for c in markers):
-        return text
-
-    candidates = []
-
-    try:
-        candidates.append(
-            text.encode("latin1").decode("utf-8")
-        )
-    except Exception:
-        pass
-
-    try:
-        candidates.append(
-            text.encode("cp1252").decode("utf-8")
-        )
-    except Exception:
-        pass
-
-    if not candidates:
-        return text
-
-    # 选择中文/非 ASCII 更合理的结果
-    def score(value):
-        chinese = sum(
-            1 for c in value
-            if "\u4e00" <= c <= "\u9fff"
-        )
-        replacement = value.count(" ")
-        mojibake = sum(
-            value.count(c)
-            for c in ("Ã", "Â", "â", "è", "ç", "å", "æ")
-        )
-        return chinese * 10 - replacement * 20 - mojibake * 5
-
-    best = max(candidates, key=score)
-
-    if score(best) > score(text):
-        return best
-
-    return text
-
-
-def clean_drive_filename(filename):
-    if not filename:
-        return None
-
-    filename = html.unescape(str(filename))
-    filename = fix_mojibake(filename)
-
-    # 删除 Google Drive 页面标题附加文字
-    filename = re.sub(
-        r"\s*-\s*Google\s+(?:云端硬盘|云端硬盘|Drive)\s*$",
-        "",
-        filename,
-        flags=re.IGNORECASE,
-    )
-
-    filename = filename.strip()
-
-    return sanitize_filename(filename)
-
-
-def filename_from_content_disposition(value):
-    if not value:
-        return None
-
-    # RFC 5987
-    match = re.search(
-        r"filename\*\s*=\s*(?:UTF-8'')?([^;]+)",
-        value,
-        re.IGNORECASE,
-    )
-
-    if match:
-        value = match.group(1).strip().strip('"')
-        try:
-            value = unquote(value)
-        except Exception:
-            pass
-
-        value = fix_mojibake(value)
-        value = sanitize_filename(value)
-
-        if value:
-            return value
-
-    match = re.search(
-        r'filename\s*=\s*"([^"]+)"',
-        value,
-        re.IGNORECASE,
-    )
-
-    if match:
-        value = fix_mojibake(match.group(1))
-        return sanitize_filename(value)
-
-    match = re.search(
-        r"filename\s*=\s*([^;]+)",
-        value,
-        re.IGNORECASE,
-    )
-
-    if match:
-        value = fix_mojibake(match.group(1).strip())
-        return sanitize_filename(value)
-
-    return None
-
-
-def extension_from_content_type(content_type):
-    if not content_type:
-        return None
-
-    content_type = content_type.split(";")[0].strip().lower()
-
-    return VIDEO_EXTENSIONS.get(content_type)
-
-
-def add_extension_if_missing(filename, content_type=None):
-    if not filename:
-        return filename
-
-    # 已经存在扩展名
-    if os.path.splitext(filename)[1]:
-        return filename
-
-    extension = extension_from_content_type(content_type)
-
-    if extension:
-        return filename + extension
-
-    return filename
-
-
-def get_unique_filepath(output_dir, filename):
-    """
-    如果目标文件已经存在，则自动在文件名后添加数字：
-    video.mp4
-    video (1).mp4
-    video (2).mp4
-    ...
-    """
-    filename = sanitize_filename(filename) or "video"
-
-    stem, ext = os.path.splitext(filename)
-    candidate = os.path.join(output_dir, filename)
-
-    number = 1
-    while os.path.exists(candidate) or os.path.exists(candidate + ".part"):
-        candidate_name = f"{stem} ({number}){ext}"
-        candidate = os.path.join(output_dir, candidate_name)
-        number += 1
-
-    return candidate
-
-
-# ============================================================
-# Drive 页面文件信息
-# ============================================================
-
-def get_drive_page_info(session, file_id):
-    """
-    只负责读取 Drive 原始文件名。
-
-    优先级：
-    1. title
-    2. og:title
-    3. twitter:title
-    4. JSON name
-    5. JSON fileName
-
-    Content-Disposition 不在这里参与。
-    """
-
-    url = f"https://drive.google.com/file/d/{file_id}/view"
-
-    response = session.get(
-        url,
-        headers=HEADERS,
-        timeout=TIMEOUT,
-        allow_redirects=True,
-    )
-
-    if not response.ok:
-        raise Exception(
-            f"无法打开 Google Drive 页面：HTTP {response.status_code}"
-        )
-
-    # 不直接使用 response.text，避免编码猜测导致中文乱码
-    raw = response.content
-
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError:
-        text = raw.decode("utf-8", errors="replace")
-
-    soup = BeautifulSoup(text, "html.parser")
-
-    # ① title
-    title = soup.find("title")
-    if title:
-        filename = clean_drive_filename(
-            title.get_text(strip=True)
-        )
-        if filename:
-            return filename
-
-    # ② og:title
-    meta = soup.find(
-        "meta",
-        attrs={"property": "og:title"},
-    )
-    if meta:
-        filename = clean_drive_filename(
-            meta.get("content")
-        )
-        if filename:
-            return filename
-
-    # ③ twitter:title
-    meta = soup.find(
-        "meta",
-        attrs={"name": "twitter:title"},
-    )
-    if meta:
-        filename = clean_drive_filename(
-            meta.get("content")
-        )
-        if filename:
-            return filename
-
-    # ④ 页面 JSON
-    patterns = [
-        r'"name"\s*:\s*"([^"]+)"',
-        r'\\"name\\"\s*:\s*\\"([^"]+)\\"',
-        r'"fileName"\s*:\s*"([^"]+)"',
-        r'\\"fileName\\"\s*:\s*\\"([^"]+)\\"',
-    ]
-
-    for pattern in patterns:
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE,
-        )
-
-        if not match:
-            continue
-
-        value = (
-            match.group(1)
-            .replace('\\"', '"')
-            .replace("\\/", "/")
-        )
-
-        filename = clean_drive_filename(value)
-
-        if filename:
-            return filename
-
-    return None
-
-
-# ============================================================
-# Google 下载确认页面
-# ============================================================
-
-def is_html_response(response):
-    content_type = response.headers.get(
-        "Content-Type", ""
-    ).lower()
-
-    return (
-        "text/html" in content_type
-        or "application/xhtml" in content_type
-    )
-
-
-def response_looks_like_file(response):
-    if is_html_response(response):
-        return False
-
-    content_type = response.headers.get(
-        "Content-Type", ""
-    ).lower()
-
-    if content_type.startswith("video/"):
-        return True
-
-    if "application/octet-stream" in content_type:
-        return True
-
-    if "application/mp4" in content_type:
-        return True
-
-    disposition = response.headers.get(
-        "Content-Disposition", ""
-    )
-
-    if disposition and "attachment" in disposition.lower():
-        return True
-
-    return False
-
-
-def parse_download_confirmation(
-    session,
-    response,
-    file_id,
-):
-    try:
-        text = response.text
-    except Exception:
-        return None
-
-    soup = BeautifulSoup(
-        text,
-        "html.parser",
-    )
-
-    # ① form
-    for form in soup.find_all("form"):
-        action = form.get("action")
-
-        if not action:
-            continue
-
-        action = html.unescape(action)
-        action = urljoin(response.url, action)
-
-        params = {}
-
-        for tag in form.find_all("input"):
-            name = tag.get("name")
-            if name:
-                params[name] = tag.get("value", "")
-
-        params.setdefault("id", file_id)
-
-        try:
-            r = session.get(
-                action,
-                params=params,
-                headers=HEADERS,
-                stream=True,
-                timeout=TIMEOUT,
-                allow_redirects=True,
-            )
-
-            if response_looks_like_file(r):
-                return r
-
-            r.close()
-
-        except Exception:
-            pass
-
-    # ② href
-    for a in soup.find_all("a", href=True):
-        href = html.unescape(a.get("href"))
-
-        if not href:
-            continue
-
-        if (
-            "download" not in href.lower()
-            and "usercontent" not in href.lower()
-        ):
-            continue
-
-        href = urljoin(response.url, href)
-
-        try:
-            r = session.get(
-                href,
-                headers=HEADERS,
-                stream=True,
-                timeout=TIMEOUT,
-                allow_redirects=True,
-            )
-
-            if response_looks_like_file(r):
-                return r
-
-            r.close()
-
-        except Exception:
-            pass
-
-    # ③ HTML 内直接 URL
-    patterns = [
-        r'https://drive\.usercontent\.google\.com/download[^"\']+',
-        r'https:\\/\\/drive\.usercontent\.google\.com\\/download[^"\']+',
-    ]
-
-    for pattern in patterns:
-        for match in re.findall(
-            pattern,
-            text,
-            re.IGNORECASE,
-        ):
-            download_url = (
-                html.unescape(match)
-                .replace("\\/", "/")
-            )
-
-            try:
-                r = session.get(
-                    download_url,
-                    headers=HEADERS,
-                    stream=True,
-                    timeout=TIMEOUT,
-                    allow_redirects=True,
-                )
-
-                if response_looks_like_file(r):
-                    return r
-
-                r.close()
-
-            except Exception:
-                pass
-
-    return None
-
-
-def get_real_download_response(
-    session,
-    file_id,
-):
-    url = "https://drive.google.com/uc"
-
-    params = {
-        "export": "download",
-        "id": file_id,
-    }
-
-    response = session.get(
-        url,
-        params=params,
-        headers=HEADERS,
-        stream=True,
-        timeout=TIMEOUT,
-        allow_redirects=True,
-    )
-
-    if response_looks_like_file(response):
-        return response
-
-    if not is_html_response(response):
-        response.close()
-        raise Exception(
-            "Google 返回了无法识别的响应。"
-        )
-
-    real_response = parse_download_confirmation(
-        session,
-        response,
-        file_id,
-    )
-
-    response.close()
-
-    if real_response:
-        if response_looks_like_file(real_response):
-            return real_response
-
-        real_response.close()
-
-    raise Exception(
-        "Google 返回了下载确认页面，"
-        "但没有成功解析出最终文件下载地址。"
-    )
-
-
-# ============================================================
-# 文件大小
-# ============================================================
-
-def get_total_size(response):
-    content_range = response.headers.get(
-        "Content-Range"
-    )
-
-    if content_range:
-        match = re.search(
-            r"/(\d+)$",
-            content_range,
-        )
-        if match:
-            try:
-                return int(match.group(1))
-            except Exception:
-                pass
-
-    content_length = response.headers.get(
-        "Content-Length"
-    )
-
-    if content_length:
-        try:
-            return int(content_length)
-        except Exception:
-            pass
-
-    return None
-
-
-# ============================================================
-# Range
-# ============================================================
-
-def request_with_range(
-    session,
-    download_url,
-    start,
-):
-    headers = HEADERS.copy()
-    headers["Range"] = f"bytes={start}-"
-
-    response = session.get(
-        download_url,
-        headers=headers,
-        stream=True,
-        timeout=TIMEOUT,
-        allow_redirects=True,
-    )
-
-    if response.status_code != 206:
-        response.close()
-        return None
-
-    content_range = response.headers.get(
-        "Content-Range",
-        "",
-    )
-
-    match = re.match(
-        r"bytes\s+(\d+)-(\d+)/(\d+|\*)",
-        content_range,
-    )
-
+def get_drive_id(url: str) -> str:
+    match = ID_RE.search(url)
     if not match:
-        response.close()
+        raise ValueError(f"无法从链接中读取 Google Drive 文件 ID：{url}")
+    return match.group(1)
+
+
+def safe_filename(name: str) -> str:
+    name = name.strip().replace("/", "_").replace("\\", "_")
+    name = re.sub(r'[<>:"|?*\x00-\x1f]', "_", name).rstrip(" .")
+    if not name or name in {".", ".."}:
+        raise ValueError("自定义名称不能为空，也不能是 . 或 ..")
+    return name
+
+
+def resolve_file_target(target: Path) -> tuple[Path, bool]:
+    """Avoid treating a same-named directory as an already-downloaded file.
+
+    Windows cannot store a file and directory at the exact same path. If a
+    folder occupies the requested file path, keep the folder and give the file
+    a clear ``（文件）`` suffix instead of incorrectly skipping it.
+    """
+    if not target.exists() or not target.is_dir():
+        return target, False
+
+    stem = target.stem if target.suffix else target.name
+    suffix = target.suffix
+    index = 1
+    while True:
+        label = "（文件）" if index == 1 else f"（文件 {index}）"
+        candidate = target.with_name(f"{stem}{label}{suffix}")
+        if not candidate.exists():
+            return candidate, True
+        if candidate.is_file():
+            # An actual file with the disambiguated name already exists.
+            return candidate, True
+        index += 1
+
+
+def add_missing_extension(name: str, mime_type: str) -> str:
+    """Preserve a supplied suffix, or infer one from the Drive MIME type."""
+    if Path(name).suffix:
+        return name
+    extension = MIME_EXTENSIONS.get(mime_type.lower())
+    if not extension:
+        extension = mimetypes.guess_extension(mime_type, strict=False)
+    return name + extension if extension else name
+
+
+def credentials_file(custom_path: str | None = None) -> Path | None:
+    """Return the path to credentials.json from user configuration.
+
+    Args:
+        custom_path: Optional custom path to credentials.json file
+
+    Returns:
+        Path to credentials.json file, or None if not configured
+    """
+    # First priority: custom path provided by caller
+    if custom_path:
+        return Path(custom_path)
+
+    # Second priority: user-configured path from settings
+    user_configured = load_credentials_path()
+    if user_configured:
+        return Path(user_configured)
+
+    # No default path - user must configure it
+    return None
+
+
+def config_dir() -> Path:
+    """Return the application configuration directory."""
+    root = Path(os.environ.get("APPDATA", Path.home())) / "GoogleDriveDownloader"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def token_file() -> Path:
+    return config_dir() / "token.json"
+
+
+def config_file() -> Path:
+    """Return the path to the configuration file storing user settings."""
+    return config_dir() / "config.json"
+
+
+def load_credentials_path() -> str | None:
+    """Load the user-configured credentials.json path from config file."""
+    import json
+    cfg = config_file()
+    if not cfg.is_file():
+        return None
+    try:
+        data = json.loads(cfg.read_text(encoding="utf-8"))
+        return data.get("credentials_path")
+    except Exception:
         return None
 
-    actual_start = int(match.group(1))
 
-    if actual_start != start:
-        response.close()
-        return None
+def save_credentials_path(path: str) -> None:
+    """Save the user-configured credentials.json path to config file."""
+    import json
+    cfg = config_file()
+    data = {"credentials_path": path}
+    cfg.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    return response
 
+def authorize_drive(custom_credentials_path: str | None = None):
+    """Load/refresh the local user's token, or open the first-run OAuth flow.
 
-# ============================================================
-# 下载器
-# ============================================================
+    Args:
+        custom_credentials_path: Optional path to credentials.json file
 
-class Downloader:
+    Returns:
+        Tuple of (service, credentials)
+    """
+    from google.auth.transport.requests import Request
+    from google.auth.exceptions import RefreshError
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
 
-    def __init__(self, app):
-        self.app = app
-        self.stop_requested = False
+    scopes = ["https://www.googleapis.com/auth/drive.readonly"]
+    client_file = credentials_file(custom_credentials_path)
 
-    def stop(self):
-        self.stop_requested = True
-
-    def download_file(
-        self,
-        file_id,
-        output_dir,
-        index,
-        total,
-        custom_name=None,
-    ):
-        for attempt in range(1, MAX_RETRIES + 1):
-
-            if self.stop_requested:
-                return False
-
-            try:
-                return self.download_once(
-                    file_id,
-                    output_dir,
-                    index,
-                    total,
-                    custom_name,
-                )
-
-            except Exception as e:
-
-                self.app.log(
-                    f"[{index}/{total}] "
-                    f"第 {attempt} 次失败：{e}"
-                )
-
-                if attempt < MAX_RETRIES:
-                    self.app.log(
-                        f"[{index}/{total}] 准备重试..."
-                    )
-
-                    for _ in range(3):
-                        if self.stop_requested:
-                            return False
-                        time.sleep(1)
-
-        self.app.log(
-            f"[{index}/{total}] 下载最终失败。"
+    if client_file is None:
+        raise FileNotFoundError(
+            "未配置 credentials.json 文件路径。\n\n"
+            "请通过菜单栏【设置】→【配置 Credentials 文件路径】指定您的 OAuth 客户端 JSON 文件路径。\n\n"
+            "步骤：\n"
+            "1. 在您自己的 Google Cloud 项目中创建 OAuth 2.0 客户端 ID（应用类型：桌面应用）\n"
+            "2. 下载 credentials.json 文件\n"
+            "3. 在本程序的设置菜单中指定该文件的完整路径"
         )
 
-        return False
+    saved_token = token_file()
+    if not client_file.is_file():
+        raise FileNotFoundError(
+            f"配置的 credentials.json 文件不存在：\n{client_file}\n\n"
+            "请通过菜单栏【设置】→【配置 Credentials 文件路径】重新配置正确的文件路径。\n\n"
+            "如果您还没有 credentials.json 文件，请先：\n"
+            "1. 在您自己的 Google Cloud 项目中创建 OAuth 2.0 客户端 ID（应用类型：桌面应用）\n"
+            "2. 下载 credentials.json 文件\n"
+            "3. 在设置中指定该文件的完整路径"
+        )
 
-    def download_once(
-        self,
-        file_id,
-        output_dir,
-        index,
-        total,
-        custom_name=None,
-    ):
-        session = requests.Session()
-        session.headers.update(HEADERS)
-
-        response = None
-
+    creds = None
+    if saved_token.is_file():
         try:
-            # ------------------------------------------------
-            # ① 先从 Drive 页面获取原始文件名
-            # ------------------------------------------------
-            filename = get_drive_page_info(
-                session,
-                file_id,
-            )
-
-            self.app.log(
-                f"[{index}/{total}] "
-                f"Drive 原始文件名：{filename or '(未读取到)'}"
-            )
-
-            # ------------------------------------------------
-            # ② 获取真实下载响应
-            # ------------------------------------------------
-            response = get_real_download_response(
-                session,
-                file_id,
-            )
-
-            content_type = response.headers.get(
-                "Content-Type",
-                "",
-            )
-
-            # ------------------------------------------------
-            # ③ 文件名兜底
-            #
-            # 只有 Drive 页面完全读取不到文件名时，
-            # 才允许使用 Content-Disposition。
-            #
-            # 绝不覆盖已经正确读取的 Drive 文件名。
-            # ------------------------------------------------
-            if not filename:
-                filename = filename_from_content_disposition(
-                    response.headers.get(
-                        "Content-Disposition"
-                    )
-                )
-
-            # ------------------------------------------------
-            # ④ 文件名
-            # 如果勾选“允许改名”，则优先使用这一行链接后面的名称
-            # ------------------------------------------------
-            if custom_name:
-                filename = sanitize_filename(custom_name)
-
-            if not filename:
-                filename = file_id
-
-            # 自动补视频扩展名
-            filename = add_extension_if_missing(
-                filename,
-                content_type,
-            )
-
-            filename = sanitize_filename(filename)
-
-            if not filename:
-                filename = file_id
-
-            # 如果重名，自动变成：
-            # 文件名.mp4
-            # 文件名 (1).mp4
-            # 文件名 (2).mp4
-            final_path = get_unique_filepath(
-                output_dir,
-                filename,
-            )
-
-            filename = os.path.basename(final_path)
-            part_path = final_path + ".part"
-
-            self.app.log(
-                f"[{index}/{total}] "
-                f"最终保存文件名：{filename}"
-            )
-
-            # ------------------------------------------------
-            # ⑤ 获取文件大小
-            # ------------------------------------------------
-            total_size = get_total_size(response)
-
-            # ------------------------------------------------
-            # ⑥ 已存在正式文件
-            # ------------------------------------------------
-            if os.path.exists(final_path):
-
-                existing_final_size = os.path.getsize(
-                    final_path
-                )
-
-                if (
-                    total_size is not None
-                    and existing_final_size == total_size
-                ):
-                    response.close()
-                    response = None
-
-                    self.app.log(
-                        f"[{index}/{total}] "
-                        f"已存在，跳过：{filename}"
-                    )
-
-                    self.app.file_finished(
-                        index,
-                        total,
-                    )
-
-                    return True
-
-            # ------------------------------------------------
-            # ⑦ .part 断点
-            # ------------------------------------------------
-            existing_size = 0
-
-            if os.path.exists(part_path):
-                existing_size = os.path.getsize(
-                    part_path
-                )
-
-            if existing_size > 0:
-
-                download_url = response.url
-
-                response.close()
-                response = None
-
-                self.app.log(
-                    f"[{index}/{total}] "
-                    f"发现断点：{format_size(existing_size)}"
-                )
-
-                range_response = request_with_range(
-                    session,
-                    download_url,
-                    existing_size,
-                )
-
-                if range_response:
-
-                    response = range_response
-
-                    total_size = get_total_size(
-                        response
-                    )
-
-                    self.app.log(
-                        f"[{index}/{total}] "
-                        f"服务器确认断点续传。"
-                    )
-
-                else:
-
-                    self.app.log(
-                        f"[{index}/{total}] "
-                        f"服务器未正确返回 206，"
-                        f"删除旧 .part，从头下载。"
-                    )
-
-                    try:
-                        os.remove(part_path)
-                    except Exception:
-                        pass
-
-                    existing_size = 0
-
-                    response = get_real_download_response(
-                        session,
-                        file_id,
-                    )
-
-                    total_size = get_total_size(
-                        response
-                    )
-
-            # ------------------------------------------------
-            # ⑧ 更新界面
-            # ------------------------------------------------
-            self.app.update_file_info(
-                index,
-                total,
-                filename,
-                total_size,
-                existing_size,
-            )
-
-            # ------------------------------------------------
-            # ⑨ 下载
-            # ------------------------------------------------
-            mode = "ab" if existing_size > 0 else "wb"
-
-            downloaded = existing_size
-            last_time = time.time()
-            last_bytes = downloaded
-
-            with open(part_path, mode) as f:
-
-                for chunk in response.iter_content(
-                    chunk_size=CHUNK_SIZE
-                ):
-                    if self.stop_requested:
-
-                        f.flush()
-
-                        self.app.log(
-                            f"[{index}/{total}] "
-                            f"已停止：{filename}"
-                        )
-
-                        return False
-
-                    if not chunk:
-                        continue
-
-                    f.write(chunk)
-                    downloaded += len(chunk)
-
-                    now = time.time()
-
-                    if now - last_time >= 0.2:
-
-                        elapsed = now - last_time
-
-                        speed = (
-                            downloaded - last_bytes
-                        ) / elapsed
-
-                        last_time = now
-                        last_bytes = downloaded
-
-                        self.app.update_progress(
-                            index,
-                            total,
-                            filename,
-                            downloaded,
-                            total_size,
-                            speed,
-                        )
-
-            response.close()
-            response = None
-
-            # ------------------------------------------------
-            # ⑩ 最终大小校验
-            # ------------------------------------------------
-            actual_size = os.path.getsize(
-                part_path
-            )
-
-            if total_size is not None:
-                if actual_size != total_size:
-                    raise Exception(
-                        "下载完成但文件大小不一致："
-                        f"{format_size(actual_size)} / "
-                        f"{format_size(total_size)}"
-                    )
-
-            # ------------------------------------------------
-            # ⑪ 防止 HTML 页面误保存
-            # ------------------------------------------------
-            with open(
-                part_path,
-                "rb"
-            ) as f:
-                first_bytes = f.read(32)
-
-            if (
-                first_bytes.startswith(b"<html")
-                or first_bytes.startswith(b"<!DOCTYPE")
-                or b"<html" in first_bytes.lower()
-            ):
-                raise Exception(
-                    "下载结果是 HTML 页面，不是视频文件。"
-                )
-
-            # ------------------------------------------------
-            # ⑫ 完成
-            # ------------------------------------------------
-            if os.path.exists(final_path):
-                os.remove(final_path)
-
-            os.replace(
-                part_path,
-                final_path,
-            )
-
-            self.app.update_progress(
-                index,
-                total,
-                filename,
-                actual_size,
-                total_size,
-                0,
-            )
-
-            self.app.log(
-                f"[{index}/{total}] "
-                f"✓ 下载完成：{filename}"
-            )
-
-            self.app.file_finished(
-                index,
-                total,
-            )
-
-            return True
-
-        finally:
-
-            if response is not None:
-                try:
-                    response.close()
-                except Exception:
-                    pass
-
-            session.close()
-
-
-# ============================================================
-# GUI
-# ============================================================
-
-class App:
-
-    def __init__(self, root):
-
-        self.root = root
-
-        self.root.title(
-            "Google Drive 视频批量下载器"
-        )
-
-        self.root.geometry(
-            "1050x780"
-        )
-
-        self.root.minsize(
-            900,
-            650
-        )
-
-        self.downloader = None
-        self.downloading = False
-        self.total_files = 0
-        self.finished_files = 0
-
-        self.setup_dark_theme()
-        self.create_ui()
-
-    # --------------------------------------------------------
-    # 深色主题
-    # --------------------------------------------------------
-
-    def setup_dark_theme(self):
-
+            creds = Credentials.from_authorized_user_file(str(saved_token), scopes)
+        except (ValueError, OSError):
+            creds = None
+
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+        except RefreshError:
+            # Revoked/expired refresh token: obtain a fresh authorization.
+            creds = None
+
+    if not creds or not creds.valid:
+        flow = InstalledAppFlow.from_client_secrets_file(str(client_file), scopes)
+        creds = flow.run_local_server(host="127.0.0.1", port=0, open_browser=True)
+
+    saved_token.write_text(creds.to_json(), encoding="utf-8")
+    return build("drive", "v3", credentials=creds, cache_discovery=False), creds
+
+
+class App(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("Google Drive 下载器")
+        self.geometry("1180x760")
+        self.minsize(900, 600)
+        self.events: queue.Queue[tuple] = queue.Queue()
+        self.running = False
+        self.total_items = 0
+        self.finished_items = 0
+        self.stop_event = threading.Event()
+        self.record_item_map: dict[str, str] = {}
+        self.dest = tk.StringVar(value=str(Path.home() / "Downloads"))
+        self.credentials_path = load_credentials_path()  # Load user-configured credentials path
+        self.setup_modern_dark_theme()
+        self._build()
+        self.after(100, self._poll)
+
+    def setup_modern_dark_theme(self):
         style = ttk.Style()
-
         try:
             style.theme_use("clam")
         except Exception:
             pass
-
-        bg = "#171717"
-        panel = "#222222"
-        fg = "#F0F0F0"
-        entry_bg = "#2B2B2B"
-        select_bg = "#444444"
-
-        self.root.configure(bg=bg)
-
-        style.configure(
-            ".",
-            background=bg,
-            foreground=fg,
-            font=("Microsoft YaHei", 10),
-        )
-
-        style.configure(
-            "TFrame",
-            background=bg,
-        )
-
-        style.configure(
-            "TLabelframe",
-            background=bg,
-            foreground=fg,
-        )
-
-        style.configure(
-            "TLabelframe.Label",
-            background=bg,
-            foreground=fg,
-        )
-
-        style.configure(
-            "TLabel",
-            background=bg,
-            foreground=fg,
-        )
-
-        style.configure(
-            "TButton",
-            background=panel,
-            foreground=fg,
-            padding=(12, 6),
-        )
-
-        style.map(
-            "TButton",
-            background=[
-                ("active", select_bg),
-                ("pressed", "#555555"),
-            ],
-            foreground=[
-                ("disabled", "#777777"),
-            ],
-        )
-
-        style.configure(
-            "TEntry",
-            fieldbackground=entry_bg,
-            foreground=fg,
-            insertcolor=fg,
-        )
-
-        style.configure(
-            "Treeview",
-            background="#222222",
-            foreground="#F0F0F0",
-            fieldbackground="#222222",
-        )
-
-        style.map(
-            "Treeview",
-            background=[
-                ("selected", "#FFFFFF"),
-            ],
-            foreground=[
-                ("selected", "#000000"),
-            ],
-        )
-
-        style.configure(
-            "Horizontal.TProgressbar",
-            background="#4CAF50",
-            troughcolor="#303030",
-            bordercolor="#303030",
-            lightcolor="#4CAF50",
-            darkcolor="#4CAF50",
-        )
-
-    # --------------------------------------------------------
-    # UI
-    # --------------------------------------------------------
-
-    def create_ui(self):
-
-        main = ttk.Frame(
-            self.root,
-            padding=15,
-        )
-
-        main.pack(
-            fill="both",
-            expand=True,
-        )
-
-        title = ttk.Label(
-            main,
-            text="Google Drive 视频批量下载器",
-            font=(
-                "Microsoft YaHei",
-                18,
-                "bold",
-            ),
-        )
-
-        title.pack(
-            anchor="w",
-            pady=(0, 10),
-        )
-
-        # ====================================================
-        # 视频链接表格
-        # ====================================================
-
-        link_frame = ttk.LabelFrame(
-            main,
-            text="视频链接列表",
-            padding=10,
-        )
-
-        link_frame.pack(
-            fill="both",
-            expand=True,
-        )
-
-        table_frame = ttk.Frame(link_frame)
-        table_frame.pack(
-            fill="both",
-            expand=True,
-        )
-
-        self.link_tree = ttk.Treeview(
-            table_frame,
-            columns=("url", "name"),
-            show="headings",
-            selectmode="extended",
-        )
-
-        self.link_tree.heading(
-            "url",
-            text="链接",
-        )
-
-        self.link_tree.heading(
-            "name",
-            text="新文件名",
-        )
-
-        self.link_tree.column(
-            "url",
-            width=650,
-            anchor="w",
-        )
-
-        self.link_tree.column(
-            "name",
-            width=280,
-            anchor="w",
-        )
-
-        tree_scroll = ttk.Scrollbar(
-            table_frame,
-            orient="vertical",
-            command=self.link_tree.yview,
-        )
-
-        self.link_tree.configure(
-            yscrollcommand=tree_scroll.set,
-        )
-
-        self.link_tree.pack(
-            side="left",
-            fill="both",
-            expand=True,
-        )
-
-        tree_scroll.pack(
-            side="right",
-            fill="y",
-        )
-
-        ttk.Label(
-            link_frame,
-            text="双击单元格可以编辑；勾选“允许改名”后，第二列的新文件名才会生效。",
-        ).pack(
-            anchor="w",
-            pady=(6, 4),
-        )
-
-        table_btn_frame = ttk.Frame(link_frame)
-        table_btn_frame.pack(
-            fill="x",
-            pady=(0, 4),
-        )
-
-        ttk.Button(
-            table_btn_frame,
-            text="添加链接",
-            command=self.add_link_row,
-        ).pack(
-            side="left",
-            padx=(0, 5),
-        )
-
-        ttk.Button(
-            table_btn_frame,
-            text="删除选中",
-            command=self.delete_selected_rows,
-        ).pack(
-            side="left",
-            padx=5,
-        )
-
-        ttk.Button(
-            table_btn_frame,
-            text="清空列表",
-            command=self.clear_link_rows,
-        ).pack(
-            side="left",
-            padx=5,
-        )
-
-        self.link_tree.bind(
-            "<Double-1>",
-            self.edit_link_cell,
-        )
-
-        # 支持直接把剪贴板中的整列链接粘贴到“链接”列。
-        # 一行一个链接；如果没有选中行，则从列表末尾继续添加。
-        self.link_tree.bind(
-            "<Control-v>",
-            self.paste_links,
-        )
-        self.link_tree.bind(
-            "<Control-V>",
-            self.paste_links,
-        )
-        self.link_tree.bind(
-            "<Shift-Insert>",
-            self.paste_links,
-        )
-
-        self.rename_var = tk.BooleanVar(
-            value=False,
-        )
-
-        ttk.Checkbutton(
-            link_frame,
-            text="允许改名",
-            variable=self.rename_var,
-        ).pack(
-            anchor="w",
-            pady=(2, 0),
-        )
-
-        ttk.Label(
-            link_frame,
-            text="未勾选：使用 Google Drive 原文件名；勾选：使用第二列填写的新文件名。",
-        ).pack(
-            anchor="w",
-            pady=(2, 0),
-        )
-
-        # ====================================================
-        # 下载目录
-        # ====================================================
-
-        folder_frame = ttk.Frame(main)
-
-        folder_frame.pack(
-            fill="x",
-            pady=10,
-        )
-
-        ttk.Label(
-            folder_frame,
-            text="下载目录：",
-        ).pack(side="left")
-
-        self.folder_var = tk.StringVar(
-            value=os.path.join(
-                os.path.expanduser("~"),
-                "Downloads",
-            )
-        )
-
-        ttk.Entry(
-            folder_frame,
-            textvariable=self.folder_var,
-        ).pack(
-            side="left",
-            fill="x",
-            expand=True,
-            padx=5,
-        )
-
-        ttk.Button(
-            folder_frame,
-            text="选择目录",
-            command=self.choose_folder,
-        ).pack(side="right")
-
-        # ====================================================
-        # 按钮
-        # ====================================================
-
-        button_frame = ttk.Frame(main)
-
-        button_frame.pack(
-            fill="x",
-            pady=(0, 10),
-        )
-
-        self.start_button = ttk.Button(
-            button_frame,
-            text="开始下载",
-            command=self.start_download,
-        )
-
-        self.start_button.pack(
-            side="left",
-            padx=(0, 5),
-        )
-
-        self.stop_button = ttk.Button(
-            button_frame,
-            text="停止",
-            command=self.stop_download,
-            state="disabled",
-        )
-
-        self.stop_button.pack(
-            side="left",
-            padx=5,
-        )
-
-        ttk.Button(
-            button_frame,
-            text="清空链接",
-            command=self.clear_links,
-        ).pack(
-            side="left",
-            padx=5,
-        )
-
-        # ====================================================
-        # 当前文件
-        # ====================================================
-
-        info_frame = ttk.LabelFrame(
-            main,
-            text="当前下载",
-            padding=10,
-        )
-
-        info_frame.pack(fill="x")
-
-        self.current_file_var = tk.StringVar(
-            value="等待下载"
-        )
-
-        ttk.Label(
-            info_frame,
-            textvariable=self.current_file_var,
-            font=("Microsoft YaHei", 10),
-        ).pack(anchor="w")
-
-        self.size_var = tk.StringVar(
-            value="文件大小：--"
-        )
-
-        ttk.Label(
-            info_frame,
-            textvariable=self.size_var,
-        ).pack(
-            anchor="w",
-            pady=(4, 0),
-        )
-
-        self.speed_var = tk.StringVar(
-            value="速度：--"
-        )
-
-        ttk.Label(
-            info_frame,
-            textvariable=self.speed_var,
-        ).pack(anchor="w")
-
-        # ====================================================
-        # 当前文件进度
-        # ====================================================
-
-        self.file_progress = ttk.Progressbar(
-            main,
-            orient="horizontal",
-            mode="determinate",
-        )
-
-        self.file_progress.pack(
-            fill="x",
-            pady=(8, 0),
-        )
-
-        self.file_progress_var = tk.StringVar(
-            value="0%"
-        )
-
-        ttk.Label(
-            main,
-            textvariable=self.file_progress_var,
-        ).pack(anchor="e")
-
-        # ====================================================
-        # 总进度
-        # ====================================================
-
-        self.total_progress = ttk.Progressbar(
-            main,
-            orient="horizontal",
-            mode="determinate",
-        )
-
-        self.total_progress.pack(
-            fill="x",
-            pady=(5, 0),
-        )
-
-        self.total_progress_var = tk.StringVar(
-            value="总进度：0 / 0"
-        )
-
-        ttk.Label(
-            main,
-            textvariable=self.total_progress_var,
-        ).pack(anchor="e")
-
-        # ====================================================
-        # 日志
-        # ====================================================
-
-        log_frame = ttk.LabelFrame(
-            main,
-            text="下载日志",
-            padding=5,
-        )
-
-        log_frame.pack(
-            fill="both",
-            expand=True,
-            pady=(10, 0),
-        )
-
-        self.log_text = tk.Text(
-            log_frame,
-            height=10,
-            font=("Consolas", 9),
-            state="disabled",
-            bg="#202020",
-            fg="#D8D8D8",
-            insertbackground="#FFFFFF",
-            selectbackground="#444444",
-            relief="flat",
-        )
-
-        self.log_text.pack(
-            side="left",
-            fill="both",
-            expand=True,
-        )
-
-        log_scroll = ttk.Scrollbar(
-            log_frame,
-            orient="vertical",
-            command=self.log_text.yview,
-        )
-
-        log_scroll.pack(
-            side="right",
-            fill="y",
-        )
-
-        self.log_text.configure(
-            yscrollcommand=log_scroll.set
-        )
-
-    # --------------------------------------------------------
-    # 选择目录
-    # --------------------------------------------------------
-
-    def choose_folder(self):
-
-        folder = filedialog.askdirectory()
-
-        if folder:
-            self.folder_var.set(folder)
-
-    # --------------------------------------------------------
-    # 清空链接
-    # --------------------------------------------------------
-
-    def clear_links(self):
-
-        if self.downloading:
-            return
-
-        self.clear_link_rows()
-
-    def log(self, text):
-
-        def update():
-
-            self.log_text.configure(
-                state="normal"
-            )
-
-            self.log_text.insert(
-                "end",
-                text + "\n",
-            )
-
-            self.log_text.see("end")
-
-            self.log_text.configure(
-                state="disabled"
-            )
-
-        self.root.after(
-            0,
-            update,
-        )
-
-    # --------------------------------------------------------
-    # 文件信息
-    # --------------------------------------------------------
-
-    def update_file_info(
-        self,
-        index,
-        total,
-        filename,
-        total_size,
-        downloaded,
-    ):
-
-        def update():
-
-            self.current_file_var.set(
-                f"[{index}/{total}] {filename}"
-            )
-
-            self.size_var.set(
-                "文件大小：" +
-                format_size(total_size)
-            )
-
-            if total_size:
-
-                percent = (
-                    downloaded /
-                    total_size *
-                    100
-                )
-
-                self.file_progress["value"] = min(
-                    percent,
-                    100,
-                )
-
-                self.file_progress_var.set(
-                    f"{percent:.2f}%"
-                )
-
-        self.root.after(
-            0,
-            update,
-        )
-
-    # --------------------------------------------------------
-    # 实时进度
-    # --------------------------------------------------------
-
-    def update_progress(
-        self,
-        index,
-        total,
-        filename,
-        downloaded,
-        total_size,
-        speed,
-    ):
-
-        def update():
-
-            self.current_file_var.set(
-                f"[{index}/{total}] {filename}"
-            )
-
-            if total_size:
-
-                percent = (
-                    downloaded /
-                    total_size *
-                    100
-                )
-
-                self.file_progress["value"] = min(
-                    percent,
-                    100,
-                )
-
-                self.file_progress_var.set(
-                    f"{percent:.2f}%    "
-                    f"{format_size(downloaded)} / "
-                    f"{format_size(total_size)}"
-                )
-
-                self.size_var.set(
-                    "文件大小：" +
-                    format_size(total_size)
-                )
-
-            else:
-
-                self.file_progress_var.set(
-                    format_size(downloaded)
-                )
-
-            self.speed_var.set(
-                "速度：" +
-                format_speed(speed)
-            )
-
-        self.root.after(
-            0,
-            update,
-        )
-
-    # --------------------------------------------------------
-    # 文件完成
-    # --------------------------------------------------------
-
-    def file_finished(
-        self,
-        index,
-        total,
-    ):
-
-        self.finished_files += 1
-
-        def update():
-
-            if self.total_files:
-
-                percent = (
-                    self.finished_files /
-                    self.total_files *
-                    100
-                )
-
-                self.total_progress["value"] = percent
-
-            self.total_progress_var.set(
-                f"总进度："
-                f"{self.finished_files} / "
-                f"{self.total_files}"
-            )
-
-        self.root.after(
-            0,
-            update,
-        )
-
-    # --------------------------------------------------------
-    # 开始
-    # --------------------------------------------------------
-
-    def add_link_row(self):
-        self.link_tree.insert("", "end", values=("", ""))
-
-    def delete_selected_rows(self):
-        for item in self.link_tree.selection():
-            self.link_tree.delete(item)
-
-    def clear_link_rows(self):
-        for item in self.link_tree.get_children():
-            self.link_tree.delete(item)
-
-    def edit_link_cell(self, event):
+        bg, fg, entry_bg = "#25272B", "#E7E9EC", "#34373C"
+        self.configure(bg=bg)
+        style.configure(".", background=bg, foreground=fg, font=("Microsoft YaHei", 10))
+        style.configure("TFrame", background=bg)
+        style.configure("TLabelframe", background=bg, foreground=fg, bordercolor="#333333", relief="solid")
+        style.configure("TLabelframe.Label", background=bg, foreground="#C9D0D7", font=("Microsoft YaHei", 10, "bold"))
+        style.configure("TLabel", background=bg, foreground=fg)
+        style.configure("TButton", background="#2C2C2C", foreground="#FFFFFF", bordercolor="#444444", padding=(10, 5))
+        style.map("TButton", background=[("active", "#3A3A3A"), ("pressed", "#555555")], foreground=[("disabled", "#666666")])
+        style.configure("Accent.TButton", background="#287DB5", foreground="#FFFFFF", font=("Microsoft YaHei", 10, "bold"))
+        style.map("Accent.TButton", background=[("active", "#358FC8"), ("pressed", "#1E689A")])
+        style.configure("TEntry", fieldbackground=entry_bg, foreground=fg, insertcolor=fg)
+        style.configure("Treeview", background="#2E3034", foreground="#F0F0F0", fieldbackground="#2E3034", rowheight=26)
+        style.configure("Treeview.Heading", background="#474A4F", foreground="#FFFFFF", font=("Microsoft YaHei", 10, "bold"))
+        style.map("Treeview", background=[("selected", "#315F7D")], foreground=[("selected", "#FFFFFF")])
+        style.configure("Horizontal.TProgressbar", background="#358FC8", troughcolor="#3A3D42")
+
+    def _build(self) -> None:
+        # Create menu bar
+        menubar = tk.Menu(self, bg="#2C2C2C", fg="#FFFFFF", activebackground="#287DB5", activeforeground="#FFFFFF")
+        self.config(menu=menubar)
+
+        settings_menu = tk.Menu(menubar, tearoff=0, bg="#2C2C2C", fg="#FFFFFF", 
+                                activebackground="#287DB5", activeforeground="#FFFFFF")
+        menubar.add_cascade(label="设置", menu=settings_menu)
+        settings_menu.add_command(label="配置 Credentials 文件路径", command=self._show_settings)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="清除当前授权", command=self._clear_authorization)
+        settings_menu.add_separator()
+        settings_menu.add_command(label="查看当前配置", command=self._show_current_config)
+
+        main = ttk.Frame(self, padding=12); main.pack(fill="both", expand=True)
+        header = ttk.Frame(main); header.pack(fill="x", pady=(0, 10))
+        ttk.Label(header, text="Google Drive 下载器", font=("Microsoft YaHei", 17, "bold"), foreground="#F1F3F5").pack(side="left")
+        body = ttk.Panedwindow(main, orient="horizontal"); body.pack(fill="both", expand=True)
+        left = ttk.Frame(body, padding=(0, 0, 8, 0)); right = ttk.Frame(body, padding=(8, 0, 0, 0))
+        body.add(left, weight=3); body.add(right, weight=2)
+        link_frame = ttk.LabelFrame(left, text="下载列表", padding=8); link_frame.pack(fill="both", expand=True, pady=(0, 8))
+        table_frame = ttk.Frame(link_frame); table_frame.pack(fill="both", expand=True)
+        self.link_tree = ttk.Treeview(table_frame, columns=("url", "name"), show="headings", selectmode="extended")
+        self.link_tree.heading("url", text="链接"); self.link_tree.heading("name", text="文件名（可选）")
+        self.link_tree.column("url", width=450, minwidth=220, anchor="w"); self.link_tree.column("name", width=190, minwidth=120, anchor="w")
+        scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.link_tree.yview)
+        self.link_tree.configure(yscrollcommand=scroll.set); self.link_tree.pack(side="left", fill="both", expand=True); scroll.pack(side="right", fill="y")
+        bottom = ttk.Frame(link_frame); bottom.pack(fill="x", pady=(8, 0))
+        ttk.Button(bottom, text="添加", command=self._add_link_row).pack(side="left", padx=(0, 6))
+        ttk.Button(bottom, text="删除选中", command=self._delete_selected_rows).pack(side="left", padx=6)
+        ttk.Button(bottom, text="清空", command=self._clear_link_rows).pack(side="left", padx=6)
+        self.rename_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(bottom, text="使用自定义名称", variable=self.rename_var).pack(side="right", padx=5)
+        self.link_tree.bind("<Double-1>", self._edit_link_cell)
+        self.link_tree.bind("<Control-v>", self._paste_links); self.link_tree.bind("<Control-V>", self._paste_links)
+        self._create_context_menu()
+        folder_frame = ttk.LabelFrame(left, text="保存位置", padding=8); folder_frame.pack(fill="x", pady=(0, 8))
+        path_row = ttk.Frame(folder_frame); path_row.pack(fill="x")
+        ttk.Entry(path_row, textvariable=self.dest).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Button(path_row, text="浏览…", command=self._choose).pack(side="right")
+        actions = ttk.Frame(left); actions.pack(fill="x")
+        self.start_btn = ttk.Button(actions, text="开始下载", command=self._start, style="Accent.TButton")
+        self.start_btn.pack(side="left", fill="x", expand=True, ipady=5, padx=(0, 5))
+        self.stop_btn = ttk.Button(actions, text="停止下载", command=self._stop, state="disabled")
+        self.stop_btn.pack(side="left", fill="x", expand=True, ipady=5, padx=(5, 0))
+        status_frame = ttk.LabelFrame(right, text="下载状态", padding=10); status_frame.pack(fill="x", pady=(0, 8))
+        self.status = ttk.Label(status_frame, text="就绪", font=("Microsoft YaHei", 10, "bold")); self.status.pack(anchor="w", pady=(0, 7))
+        self.progress = ttk.Progressbar(status_frame, orient="horizontal", mode="determinate"); self.progress.pack(fill="x")
+        record_frame = ttk.LabelFrame(right, text="运行记录", padding=8); record_frame.pack(fill="both", expand=True)
+        self.record_tree = ttk.Treeview(record_frame, columns=("seq", "name", "state", "path"), show="headings", selectmode="browse")
+        self.record_tree.tag_configure("success", foreground="#4CAF50")
+        self.record_tree.tag_configure("failure", foreground="#F05A5A")
+        for col, title in (("seq", "序号"), ("name", "文件名"), ("state", "状态/进度"), ("path", "保存路径")):
+            self.record_tree.heading(col, text=title)
+        self.record_tree.column("seq", width=55, minwidth=45, anchor="center", stretch=False)
+        self.record_tree.column("name", width=140, minwidth=100, anchor="w")
+        self.record_tree.column("state", width=105, minwidth=90, anchor="center")
+        self.record_tree.column("path", width=280, minwidth=160, anchor="w")
+        rec_scroll = ttk.Scrollbar(record_frame, orient="vertical", command=self.record_tree.yview)
+        self.record_tree.configure(yscrollcommand=rec_scroll.set); self.record_tree.pack(side="left", fill="both", expand=True); rec_scroll.pack(side="right", fill="y")
+
+    def _create_context_menu(self):
+        self.context_menu = tk.Menu(self, tearoff=0, bg="#303338", fg="#F0F0F0", activebackground="#287DB5", activeforeground="#FFFFFF")
+        self.context_menu.add_command(label="粘贴表格内容 (Ctrl+V)", command=self._paste_links)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="添加新空白行", command=self._add_link_row)
+        self.context_menu.add_command(label="删除选中行", command=self._delete_selected_rows)
+        self.context_menu.add_command(label="清空所有列表", command=self._clear_link_rows)
+        self.link_tree.bind("<Button-3>", self._show_context_menu)
+
+    def _show_context_menu(self, event):
         item = self.link_tree.identify_row(event.y)
-        column = self.link_tree.identify_column(event.x)
-        if not item or column not in ("#1", "#2"):
-            return
+        if item and item not in self.link_tree.selection(): self.link_tree.selection_set(item)
+        try: self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally: self.context_menu.grab_release()
 
+    def _choose(self) -> None:
+        chosen = filedialog.askdirectory(initialdir=self.dest.get() or str(Path.home()))
+        if chosen: self.dest.set(chosen)
+
+    def _write(self, text: str) -> None: self.status.configure(text=text)
+
+    def _add_record(self, sequence: int, name: str, state: str, path: str) -> str:
+        tag = "success" if state.startswith("已完成") else "failure" if state == "失败" else ""
+        return self.record_tree.insert("", "end", values=(sequence, name, state, path), tags=(tag,) if tag else ())
+
+    def _update_record(self, item: str, name: str | None = None, state: str | None = None, path: str | None = None) -> None:
+        if not self.record_tree.exists(item): return
+        values = list(self.record_tree.item(item, "values"))
+        if name is not None: values[1] = name
+        if state is not None: values[2] = state
+        if path is not None: values[3] = path
+        tag = "success" if str(values[2]).startswith("已完成") else "failure" if values[2] == "失败" else ""
+        self.record_tree.item(item, values=values, tags=(tag,) if tag else ())
+
+    def _stop(self) -> None:
+        if self.running:
+            self.stop_event.set(); self.stop_btn.configure(state="disabled")
+            self.status.configure(text="正在停止当前下载…")
+
+    def _add_link_row(self): self.link_tree.insert("", "end", values=("", ""))
+    def _delete_selected_rows(self):
+        for item in self.link_tree.selection(): self.link_tree.delete(item)
+    def _clear_link_rows(self):
+        for item in self.link_tree.get_children(): self.link_tree.delete(item)
+
+    def _edit_link_cell(self, event):
+        item = self.link_tree.identify_row(event.y); column = self.link_tree.identify_column(event.x)
+        if not item or column not in ("#1", "#2"): return
         bbox = self.link_tree.bbox(item, column)
-        if not bbox:
-            return
-
-        x, y, width, height = bbox
-        values = list(self.link_tree.item(item, "values"))
-        index = 0 if column == "#1" else 1
-
-        # 不再使用 ttk.Entry，避免某些 Windows 主题下编辑框变成白底。
-        # 直接使用 tk.Entry，并明确指定深色背景/浅色文字。
-        entry = tk.Entry(
-            self.link_tree,
-            bg="#2B2B2B",
-            fg="#F0F0F0",
-            insertbackground="#FFFFFF",
-            selectbackground="#444444",
-            selectforeground="#FFFFFF",
-            relief="flat",
-            borderwidth=0,
-            highlightthickness=1,
-            highlightbackground="#555555",
-            highlightcolor="#666666",
-            font=("Microsoft YaHei", 10),
-        )
-        entry.place(x=x, y=y, width=width, height=height)
-        entry.insert(0, values[index])
-        entry.select_range(0, tk.END)
-        entry.focus_set()
-
+        if not bbox: return
+        x, y, width, height = bbox; values = list(self.link_tree.item(item, "values")); index = 0 if column == "#1" else 1
+        entry = tk.Entry(self.link_tree, bg="#2A2A2A", fg="#FFFFFF", insertbackground="#FFFFFF", selectbackground="#00C853", relief="flat", borderwidth=0, highlightthickness=1, highlightbackground="#00C853", font=("Microsoft YaHei", 10))
+        entry.place(x=x, y=y, width=width, height=height); entry.insert(0, values[index]); entry.select_range(0, tk.END); entry.focus_set()
         def save(event=None):
-            if not entry.winfo_exists():
-                return
-            values[index] = entry.get().strip()
-            self.link_tree.item(item, values=values)
-            entry.destroy()
-
-        def cancel(event=None):
             if entry.winfo_exists():
-                entry.destroy()
+                values[index] = entry.get().strip(); self.link_tree.item(item, values=values); entry.destroy()
+        def cancel(event=None):
+            if entry.winfo_exists(): entry.destroy()
+        entry.bind("<Return>", save); entry.bind("<Escape>", cancel); entry.bind("<FocusOut>", save)
 
-        entry.bind("<Return>", save)
-        entry.bind("<Escape>", cancel)
-        entry.bind("<FocusOut>", save)
-
-    def paste_links(self, event=None):
-        """
-        直接把剪贴板中的多行链接粘贴到“链接”列。
-        例如：
-            https://drive.google.com/file/d/AAA/view
-            https://drive.google.com/file/d/BBB/view
-            https://drive.google.com/file/d/CCC/view
-
-        粘贴后会自动逐行创建/覆盖列表中的链接行。
-        如果当前选中了某一行，则从该行开始粘贴；
-        如果没有选中行，则从列表末尾追加。
-        """
-        try:
-            clipboard = self.root.clipboard_get()
-        except tk.TclError:
-            return "break"
-
-        if not clipboard or not clipboard.strip():
-            return "break"
-
-        # 兼容从 Excel / 表格复制整列时带来的 \t。
-        # 每一行只取第一列作为链接，空行自动忽略。
-        links = []
-        for line in clipboard.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-
-            first_cell = line.split("\t", 1)[0].strip()
-            if first_cell:
-                links.append(first_cell)
-
-        if not links:
-            return "break"
-
+    def _paste_links(self, event=None):
+        """Append links, pair tabular columns, or fill names into existing rows."""
+        try: clipboard = self.clipboard_get()
+        except Exception as exc:
+            self._write(f"读取剪贴板异常: {exc}"); return "break"
+        if not clipboard or not clipboard.strip(): return "break"
+        # Ignore blank lines anywhere in pasted content so they do not create
+        # empty rows or shift the pairing between links and optional names.
+        lines = [
+            line for line in clipboard.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            if line.strip()
+        ]
+        if not lines: return "break"
+        parsed = [line.split("\t") for line in lines]
+        is_table = any(len(cells) > 1 for cells in parsed)
+        is_url = lambda value: bool(URL_RE.search(value.strip()))
         children = list(self.link_tree.get_children())
-        selection = self.link_tree.selection()
-
-        if selection:
-            # 以当前选中的第一行作为粘贴起点。
-            try:
-                start_index = children.index(selection[0])
-            except ValueError:
-                start_index = len(children)
-        else:
-            start_index = len(children)
-
-        # 确保有足够的行。
-        while len(self.link_tree.get_children()) < start_index + len(links):
-            self.link_tree.insert("", "end", values=("", ""))
-
-        children = list(self.link_tree.get_children())
-
-        for offset, link in enumerate(links):
-            item = children[start_index + offset]
-            values = list(self.link_tree.item(item, "values"))
-
-            if len(values) < 2:
-                values = [link, ""]
+        one_col = [cells[0].strip() if cells else "" for cells in parsed]
+        names_only = not is_table and not any(is_url(value) for value in one_col if value)
+        if names_only:
+            selected = self.link_tree.selection()
+            if selected:
+                try: start = children.index(selected[0])
+                except ValueError: start = len(children)
             else:
-                values[0] = link
-
-            self.link_tree.item(item, values=values)
-
-        # 选中刚粘贴的区域，方便用户继续操作。
-        children = list(self.link_tree.get_children())
-        pasted_items = children[start_index:start_index + len(links)]
-        self.link_tree.selection_set(pasted_items)
-        if pasted_items:
-            self.link_tree.focus(pasted_items[0])
-            self.link_tree.see(pasted_items[0])
-
-        self.log(f"已粘贴 {len(links)} 个链接。")
+                start = next((i for i, item in enumerate(children) if self.link_tree.item(item, "values")[0] and not self.link_tree.item(item, "values")[1]), len(children))
+            while len(children) < start + len(one_col): children.append(self.link_tree.insert("", "end", values=("", "")))
+            for offset, name in enumerate(one_col):
+                item = children[start + offset]; url, old_name = self.link_tree.item(item, "values")
+                self.link_tree.item(item, values=(url, name or old_name))
+            self._write("已填入名称。")
+        else:
+            for cells in parsed:
+                self.link_tree.insert("", "end", values=(cells[0].strip() if cells else "", cells[1].strip() if len(cells) > 1 else ""))
+            self._write(f"已追加 {len(parsed)} 行。")
         return "break"
 
-    def start_download(self):
+    def _show_settings(self) -> None:
+        """Show settings dialog for configuring credentials.json path."""
+        dialog = tk.Toplevel(self)
+        dialog.title("配置设置")
+        dialog.geometry("700x280")
+        dialog.resizable(False, False)
+        dialog.configure(bg="#25272B")
+        dialog.transient(self)
+        dialog.grab_set()
 
-        if self.downloading:
+        # Center the dialog
+        dialog.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - dialog.winfo_width()) // 2
+        y = self.winfo_y() + (self.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{x}+{y}")
+
+        main_frame = ttk.Frame(dialog, padding=20)
+        main_frame.pack(fill="both", expand=True)
+
+        # Instructions
+        instruction_text = (
+            "请在您自己的 Google Cloud 项目中创建 OAuth 2.0 客户端 ID（应用类型：桌面应用），\n"
+            "下载 credentials.json 文件，然后在下方指定该文件的完整路径。\n\n"
+            "每个用户应使用自己的 Google Cloud 项目和凭据文件。"
+        )
+        instruction_label = ttk.Label(main_frame, text=instruction_text, 
+                                     font=("Microsoft YaHei", 9), 
+                                     foreground="#C9D0D7")
+        instruction_label.pack(anchor="w", pady=(0, 15))
+
+        # Path input
+        path_frame = ttk.Frame(main_frame)
+        path_frame.pack(fill="x", pady=(0, 20))
+
+        ttk.Label(path_frame, text="Credentials.json 文件路径：", 
+                 font=("Microsoft YaHei", 10, "bold")).pack(anchor="w", pady=(0, 5))
+
+        path_entry_frame = ttk.Frame(path_frame)
+        path_entry_frame.pack(fill="x")
+
+        path_var = tk.StringVar(value=self.credentials_path or "")
+        path_entry = ttk.Entry(path_entry_frame, textvariable=path_var, font=("Microsoft YaHei", 10))
+        path_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        def browse_file():
+            filename = filedialog.askopenfilename(
+                title="选择 credentials.json 文件",
+                filetypes=[("JSON 文件", "*.json"), ("所有文件", "*.*")],
+                initialdir=str(Path.home())
+            )
+            if filename:
+                path_var.set(filename)
+
+        ttk.Button(path_entry_frame, text="浏览…", command=browse_file).pack(side="right")
+
+        # Buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(fill="x", pady=(10, 0))
+
+        def save_and_close():
+            path = path_var.get().strip()
+            if path:
+                if not Path(path).is_file():
+                    messagebox.showwarning("文件不存在", 
+                                         f"指定的文件不存在：\n{path}\n\n请检查路径是否正确。",
+                                         parent=dialog)
+                    return
+                save_credentials_path(path)
+                self.credentials_path = path
+                messagebox.showinfo("保存成功", 
+                                  "Credentials 文件路径已保存！\n\n下次授权时将使用此文件。",
+                                  parent=dialog)
+                dialog.destroy()
+            else:
+                # Clear the configuration
+                if messagebox.askyesno("确认清除", 
+                                      "路径为空，是否清除已保存的配置？",
+                                      parent=dialog):
+                    cfg = config_file()
+                    if cfg.is_file():
+                        cfg.unlink()
+                    self.credentials_path = None
+                    messagebox.showinfo("已清除", "配置已清除。", parent=dialog)
+                    dialog.destroy()
+
+        ttk.Button(button_frame, text="保存", command=save_and_close, 
+                  style="Accent.TButton").pack(side="right", padx=(5, 0))
+        ttk.Button(button_frame, text="取消", command=dialog.destroy).pack(side="right")
+
+    def _show_current_config(self) -> None:
+        """Show current configuration information."""
+        current_path = self.credentials_path or "未配置"
+
+        message = (
+            f"当前配置的 Credentials 文件路径：\n{current_path}\n\n"
+            f"Token 保存位置：\n{token_file()}\n\n"
+            f"配置文件位置：\n{config_file()}"
+        )
+        messagebox.showinfo("当前配置", message)
+
+    def _clear_authorization(self) -> None:
+        """Clear the current authorization token."""
+        if self.running:
+            messagebox.showwarning("操作被阻止", "下载任务正在运行中，无法清除授权。\n请先停止下载任务。")
             return
 
-        download_items = []
+        token_path = token_file()
+        if not token_path.is_file():
+            messagebox.showinfo("无需清除", "当前没有保存的授权信息。")
+            return
 
+        result = messagebox.askyesno(
+            "确认清除授权",
+            "确定要清除当前保存的授权信息吗？\n\n"
+            "清除后，下次下载时需要重新进行 Google 账号授权。\n\n"
+            f"将删除文件：\n{token_path}",
+            icon="warning"
+        )
+
+        if result:
+            try:
+                token_path.unlink()
+                messagebox.showinfo("清除成功", "授权信息已清除。\n\n下次下载时需要重新授权。")
+                self._write("授权已清除，下次下载需重新授权")
+            except Exception as exc:
+                messagebox.showerror("清除失败", f"无法删除授权文件：\n{exc}")
+
+    def _start(self) -> None:
+        items = []
+        for row in self.record_tree.get_children(): self.record_tree.delete(row)
+        self.record_item_map.clear()
         for item in self.link_tree.get_children():
+            values = self.link_tree.item(item, "values"); url = values[0].strip() if values else ""; name = values[1].strip() if len(values) > 1 else ""
+            if not url: continue
+            if not URL_RE.search(url): self._write(f"跳过无效链接格式：{url}"); continue
+            items.append((url, name if self.rename_var.get() and name else None))
+        if not items:
+            messagebox.showwarning("没有有效链接", "请在表格中填写或粘贴至少一个正确的 Google Drive 链接。"); return
+        raw_dest = self.dest.get().strip()
+        if not raw_dest:
+            messagebox.showwarning("没有保存位置", "请选择保存文件夹。"); return
+        dest = Path(raw_dest).expanduser()
+        rows = []
+        for i, (url, name) in enumerate(items, 1):
+            label = name or ("Google Drive 文件夹" if is_folder_link(url) else "读取文件名…")
+            row = self._add_record(i, label, "等待中", str(dest))
+            self.record_item_map[row] = row; rows.append((url, name, row))
+        self.running = True; self.stop_event.clear(); self.start_btn.configure(state="disabled"); self.stop_btn.configure(state="normal")
+        self.progress.configure(value=0, maximum=100); self.status.configure(text=f"准备处理 {len(items)} 个下载项…")
+        self.total_items = len(rows); self.finished_items = 0
+        threading.Thread(target=self._download_worker, args=(rows, dest), daemon=True).start()
 
-            values = self.link_tree.item(
-                item,
-                "values",
-            )
+    def _list_children(self, service, folder_id: str) -> list[dict]:
+        files = []; token = None
+        while not self.stop_event.is_set():
+            result = service.files().list(
+                q=f"'{folder_id}' in parents and trashed = false", pageSize=1000, pageToken=token,
+                fields="nextPageToken,files(id,name,mimeType,size)", supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ).execute()
+            files.extend(result.get("files", [])); token = result.get("nextPageToken")
+            if not token: break
+        return files
 
-            url = (
-                values[0].strip()
-                if len(values) > 0
-                else ""
-            )
+    def _download_media(self, service, creds, file_id: str, target: Path, size: int | None,
+                        record_id: str) -> None:
+        from google.auth.transport.requests import AuthorizedSession
+        session = AuthorizedSession(creds)
+        part = target.with_name(target.name + ".part")
+        if size is not None and part.exists() and part.stat().st_size > size: part.unlink()
+        attempts = 0
+        while not self.stop_event.is_set():
+            offset = part.stat().st_size if part.exists() else 0
+            request = service.files().get_media(fileId=file_id)
+            headers = {"Range": f"bytes={offset}-"} if offset else {}
+            try:
+                with session.get(request.uri, headers=headers, stream=True, timeout=(30, 90)) as response:
+                    if response.status_code in (429, 500, 502, 503, 504):
+                        attempts += 1
+                        if attempts > 5: response.raise_for_status()
+                        wait = min(30, 2 ** attempts)
+                        self.events.put(("log", f"服务器暂时限流或繁忙，{wait} 秒后重试…"))
+                        for _ in range(wait * 10):
+                            if self.stop_event.is_set(): return
+                            time.sleep(0.1)
+                        continue
+                    response.raise_for_status()
+                    # If the server ignores Range, restart this partial file safely.
+                    mode = "ab" if offset and response.status_code == 206 else "wb"
+                    if mode == "wb": offset = 0
+                    with part.open(mode) as output:
+                        for chunk in response.iter_content(chunk_size=1024 * 1024):
+                            if self.stop_event.is_set(): return
+                            if chunk: output.write(chunk)
+                            current = part.stat().st_size if part.exists() else 0
+                            total = size or int(response.headers.get("Content-Length") or 0) + offset
+                            if total:
+                                percent = min(99.9, current * 100 / total)
+                                self.events.put(("record", record_id, None, f"{percent:.1f}%", None))
+                    if size is not None and part.stat().st_size != size:
+                        raise IOError(f"文件大小不完整：{part.stat().st_size}/{size} 字节")
+                    os.replace(part, target)
+                    return
+            except Exception as exc:
+                if self.stop_event.is_set(): return
+                attempts += 1
+                if attempts > 5: raise RuntimeError(f"下载失败：{exc}") from exc
+                wait = min(30, 2 ** attempts)
+                self.events.put(("log", f"下载中断，保留部分文件并在 {wait} 秒后续传…"))
+                for _ in range(wait * 10):
+                    if self.stop_event.is_set(): return
+                    time.sleep(0.1)
 
-            custom_name = (
-                values[1].strip()
-                if len(values) > 1
-                else ""
-            )
+    def _download_one(self, service, creds, metadata: dict, target_dir: Path, custom_name: str | None,
+                      record_id: str) -> tuple[str, str]:
+        file_id = metadata["id"]; mime = metadata.get("mimeType", "")
+        original_name = metadata.get("name") or file_id
+        export = EXPORTS.get(mime)
+        if export:
+            export_mime, extension = export
+            base = safe_filename(custom_name) if custom_name else original_name
+            if not Path(base).suffix: base += extension
+            target = target_dir / safe_filename(base)
+            target, renamed_for_folder = resolve_file_target(target)
+            if target.is_file(): return target.name, "已存在，跳过"
+            target_dir.mkdir(parents=True, exist_ok=True)
+            data = service.files().export(fileId=file_id, mimeType=export_mime).execute()
+            target.write_bytes(data)
+            return target.name, "已完成（与同名文件夹区分）" if renamed_for_folder else "已完成"
 
-            if not url:
-                continue
+        base = safe_filename(custom_name) if custom_name else safe_filename(original_name)
+        # The Drive API's name normally includes an extension, but some shared
+        # image/video files omit it. Fall back to the API MIME type in that case.
+        if custom_name:
+            source_suffix = Path(original_name).suffix
+            if not Path(base).suffix and source_suffix:
+                base += source_suffix
+        base = safe_filename(add_missing_extension(base, mime))
+        target = target_dir / base
+        target, renamed_for_folder = resolve_file_target(target)
+        if target.is_file(): return target.name, "已存在，跳过"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        size = int(metadata["size"]) if metadata.get("size") is not None else None
+        self._download_media(service, creds, file_id, target, size, record_id)
+        if self.stop_event.is_set(): return target.name, "已停止"
+        return target.name, "已完成（与同名文件夹区分）" if renamed_for_folder else "已完成"
 
-            file_id = extract_file_id(url)
+    def _download_worker(self, items: list[tuple[str, str | None, str]], dest: Path) -> None:
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            self.events.put(("status", "正在连接 Google Drive 并检查授权…"))
+            service, creds = authorize_drive(self.credentials_path)
+            sequence = 0
+            for i, (url, custom_name, root_record) in enumerate(items, 1):
+                if self.stop_event.is_set(): break
+                current_name = custom_name or url
+                current_path = str(dest)
+                self.events.put(("log", f"[{i}/{len(items)}] 正在读取：{url}"))
+                self.events.put(("record", root_record, None, "读取中", None))
+                try:
+                    drive_id = get_drive_id(url)
+                    metadata = service.files().get(fileId=drive_id, fields="id,name,mimeType,size", supportsAllDrives=True).execute()
+                    current_name = metadata.get("name") or current_name
+                    if metadata.get("mimeType") != FOLDER_MIME:
+                        sequence += 1
+                        rec = root_record
+                        self.events.put(("record", rec, current_name, "下载中", str(dest)))
+                        name, state = self._download_one(service, creds, metadata, dest, custom_name, rec)
+                        self.events.put(("record", rec, name, state, str(dest)))
+                        if state.startswith("已完成"): self.events.put(("log", f"已保存：{dest / name}"))
+                    else:
+                        root_name = safe_filename(custom_name) if custom_name else safe_filename(metadata.get("name", drive_id))
+                        root_dir = dest / root_name
+                        root_dir.mkdir(parents=True, exist_ok=True)
+                        current_name = root_name
+                        current_path = str(root_dir)
+                        self.events.put(("record", root_record, root_name, "读取文件夹…", str(root_dir)))
+                        stack = [(drive_id, root_dir)]; visited = set(); found = 0
+                        while stack and not self.stop_event.is_set():
+                            folder_id, local_dir = stack.pop()
+                            if folder_id in visited: continue
+                            visited.add(folder_id)
+                            try:
+                                children = self._list_children(service, folder_id)
+                            except Exception as exc:
+                                self.events.put(("log", f"读取子文件夹失败，跳过：{local_dir}；{exc}"))
+                                continue
+                            for child in children:
+                                if self.stop_event.is_set(): break
+                                if child.get("mimeType") == FOLDER_MIME:
+                                    child_dir = local_dir / safe_filename(child.get("name", child["id"]))
+                                    child_dir.mkdir(parents=True, exist_ok=True)
+                                    stack.append((child["id"], child_dir))
+                                    continue
+                                found += 1; sequence += 1
+                                rec = root_record if found == 1 else f"{root_record}_file_{found}"
+                                name = child.get("name", child["id"])
+                                if found == 1:
+                                    self.events.put(("record", rec, name, "下载中", str(local_dir)))
+                                else:
+                                    self.events.put(("record_add", rec, name, "下载中", str(local_dir)))
+                                try:
+                                    saved_name, state = self._download_one(service, creds, child, local_dir, None, rec)
+                                    self.events.put(("record", rec, saved_name, state, str(local_dir)))
+                                    if state.startswith("已完成"): self.events.put(("log", f"已保存：{local_dir / saved_name}"))
+                                except Exception as exc:
+                                    self.events.put(("record", rec, name, "失败", str(local_dir)))
+                                    self.events.put(("log", f"下载失败，跳过 {name}：{exc}"))
+                        if found == 0 and not self.stop_event.is_set():
+                            self.events.put(("record", root_record, root_name, "文件夹为空", str(root_dir)))
+                except Exception as exc:
+                    self.events.put(("record", root_record, current_name, "失败", current_path))
+                    self.events.put(("log", f"任务失败，跳过并继续下一项 {current_name}：{exc}"))
+                self.finished_items += 1
+                self.events.put(("progress", round(self.finished_items * 100 / self.total_items)))
+            self.events.put(("stopped",) if self.stop_event.is_set() else ("done",))
+        except Exception as exc:
+            self.events.put(("error", str(exc)))
 
-            if not file_id:
-                self.log(
-                    f"跳过无效链接：{url}"
-                )
-                continue
-
-            if not self.rename_var.get():
-                custom_name = None
-
-            elif not custom_name:
-                custom_name = None
-
-            download_items.append(
-                (
-                    file_id,
-                    custom_name,
-                )
-            )
-
-        if not download_items:
-
-            messagebox.showwarning(
-                "提示",
-                "请先添加有效的 Google Drive 视频链接。",
-            )
-
-            return
-
-        output_dir = self.folder_var.get().strip()
-
-        if not output_dir:
-
-            messagebox.showwarning(
-                "提示",
-                "请选择下载目录。",
-            )
-
-            return
-
-        os.makedirs(
-            output_dir,
-            exist_ok=True,
-        )
-
-        self.downloading = True
-        self.total_files = len(download_items)
-        self.finished_files = 0
-
-        self.start_button.configure(
-            state="disabled",
-        )
-
-        self.stop_button.configure(
-            state="normal",
-        )
-
-        self.downloader = Downloader(
-            self
-        )
-
-        thread = threading.Thread(
-            target=self.download_thread,
-            args=(
-                download_items,
-                output_dir,
-            ),
-            daemon=True,
-        )
-
-        thread.start()
-
-    def download_thread(
-        self,
-        download_items,
-        output_dir,
-    ):
-
-        total = len(download_items)
-
-        for index, (file_id, custom_name) in enumerate(
-            download_items,
-            1,
-        ):
-
-            if self.downloader.stop_requested:
-                break
-
-            self.log(
-                f"[{index}/{total}] "
-                f"File ID：{file_id}"
-            )
-
-            if custom_name:
-                self.log(
-                    f"[{index}/{total}] "
-                    f"自定义文件名：{custom_name}"
-                )
-
-            self.downloader.download_file(
-                file_id,
-                output_dir,
-                index,
-                total,
-                custom_name,
-            )
-
-        self.root.after(
-            0,
-            self.download_finished,
-        )
-
-    # --------------------------------------------------------
-    # 停止
-    # --------------------------------------------------------
-
-    def stop_download(self):
-
-        if self.downloader:
-
-            self.downloader.stop()
-
-            self.log(
-                "正在停止，当前 .part 文件会保留。"
-            )
-
-    # --------------------------------------------------------
-    # 完成
-    # --------------------------------------------------------
-
-    def download_finished(self):
-
-        self.downloading = False
-
-        self.start_button.configure(
-            state="normal"
-        )
-
-        self.stop_button.configure(
-            state="disabled"
-        )
-
-        self.speed_var.set(
-            "速度：--"
-        )
-
-        if (
-            self.downloader
-            and self.downloader.stop_requested
-        ):
-
-            self.current_file_var.set(
-                "下载已停止"
-            )
-
-            self.log(
-                "下载任务已停止。"
-            )
-
-        else:
-
-            self.current_file_var.set(
-                "全部任务处理完成"
-            )
-
-            self.log(
-                "=========================================="
-            )
-
-            self.log(
-                "全部任务处理完成。"
-            )
-
-            messagebox.showinfo(
-                "完成",
-                "下载任务处理完成。\n\n"
-                f"已完成/跳过："
-                f"{self.finished_files} / "
-                f"{self.total_files}",
-            )
-
-
-# ============================================================
-# 主程序
-# ============================================================
-
-def main():
-
-    root = tk.Tk()
-
-    try:
-        root.tk.call(
-            "tk",
-            "scaling",
-            1.2,
-        )
-    except Exception:
-        pass
-
-    App(root)
-
-    root.mainloop()
+    def _poll(self) -> None:
+        try:
+            while True:
+                event = self.events.get_nowait(); kind = event[0]
+                if kind == "log": self._write(event[1])
+                elif kind == "status": self.status.configure(text=event[1])
+                elif kind == "progress": self.progress.configure(value=event[1])
+                elif kind == "record":
+                    item = self.record_item_map.get(event[1], event[1]); self._update_record(item, event[2], event[3], event[4])
+                elif kind == "record_add":
+                    seq = len(self.record_tree.get_children()) + 1; item = self._add_record(seq, event[2], event[3], event[4]); self.record_item_map[event[1]] = item
+                elif kind == "done":
+                    self.running = False; self.start_btn.configure(state="normal"); self.stop_btn.configure(state="disabled")
+                    self.status.configure(text="全部任务处理完成！请检查保存路径。"); messagebox.showinfo("完成", "批量下载任务已全部执行完毕！")
+                elif kind == "stopped":
+                    self.running = False; self.start_btn.configure(state="normal"); self.stop_btn.configure(state="disabled")
+                    self.status.configure(text="下载已停止；已完成的文件和部分文件已保留。")
+                elif kind == "error":
+                    self.running = False; self.start_btn.configure(state="normal"); self.stop_btn.configure(state="disabled")
+                    self.status.configure(text="运行遇到错误"); self._write("错误：" + event[1]); messagebox.showerror("下载错误", event[1])
+        except queue.Empty:
+            pass
+        self.after(100, self._poll)
 
 
 if __name__ == "__main__":
-    main()
+    App().mainloop()
